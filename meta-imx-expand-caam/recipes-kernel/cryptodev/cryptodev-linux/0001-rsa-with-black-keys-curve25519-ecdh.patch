@@ -1,0 +1,59 @@
+From e0c0a55298c7723f80b22a33757014a40f4fc54d Mon Sep 17 00:00:00 2001
+From: JacobBarthelmeh <jacob@wolfssl.com>
+Date: Thu, 17 Feb 2022 09:43:24 -0800
+Subject: [PATCH] rsa with black keys, curve25519, ecdh
+
+---
+ crypto/cryptodev.h | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/crypto/cryptodev.h b/crypto/cryptodev.h
+index 213e933..d93e0cf 100644
+--- a/crypto/cryptodev.h
++++ b/crypto/cryptodev.h
+@@ -55,6 +55,12 @@ enum cryptodev_crypto_op_t {
+ 	CRYPTO_ASYM_ECDSA_SIGN,
+ 	CRYPTO_ASYM_ECDSA_VERIFY,
+ 	CRYPTO_ASYM_ECC_KEYGEN,
++	CRYPTO_ASYM_ECC_ECDH,
++
++	CRYPTO_ASYM_RSA_PRIVATE,
++	CRYPTO_ASYM_RSA_PUBLIC,
++	CRYPTO_ASYM_RSA_KEYGEN,
++	CRYPTO_ASYM_MUL_MOD,
+ 
+ 	CRYPTO_ALGORITHM_ALL, /* Keep updated - see below */
+ };
+@@ -265,6 +271,11 @@ enum cryptodev_crk_op_t {
+ 	CRK_ECDSA_SIGN = 18,
+ 	CRK_ECDSA_VERIFY = 19,
+ 	CRK_ECC_KEYGEN = 20,
++	CRK_ECC_ECDH = 21,
++	CRK_RSA_PRIVATE = 22,
++	CRK_RSA_PUBLIC = 23,
++	CRK_RSA_KEYGEN = 24,
++	CRK_MUL_MOD = 25,
+ 	CRK_ALGORITHM_ALL
+ };
+ 
+@@ -294,6 +305,12 @@ struct cphash_op {
+ #define CRF_ECDSA_VERIFY		(1 << CRK_ECDSA_VERIFY)
+ #define CRF_ECC_KEYGEN			(1 << CRK_ECC_KEYGEN)
+ 
++#define CRF_RSA_PRIVATE         (1 << CRK_RSA_PRIVATE)
++#define CRF_RSA_PUBLIC          (1 << CRK_RSA_PUBLIC)
++#define CRF_RSA_KEYGEN          (1 << CRK_RSA_KEYGEN)
++
++#define CRF_MUL_MOD             (1 << CRK_MUL_MOD)
++
+ #define	CAAM_KEY_COLOR_RED   0
+ #define	CAAM_KEY_COLOR_BLACK 1
+ 
+@@ -426,6 +443,7 @@ struct cphash_op {
+ #define CAAM_EC_CURVE_OAKLEY_4 126
+ #define CAAM_EC_CURVE_UNDEFINED	127
+ 
++#define CAAM_MUL_MOD_LE 1
+ 
+ /* ioctl's. Compatible with old linux cryptodev.h
+  */

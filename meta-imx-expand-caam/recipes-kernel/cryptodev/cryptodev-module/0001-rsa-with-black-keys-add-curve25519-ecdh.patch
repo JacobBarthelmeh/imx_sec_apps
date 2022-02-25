@@ -1,0 +1,697 @@
+From 5a8257439ad92d5cb9da2020f9fe9c4a2db77dbc Mon Sep 17 00:00:00 2001
+From: JacobBarthelmeh <jacob@wolfssl.com>
+Date: Thu, 17 Feb 2022 09:44:11 -0800
+Subject: [PATCH] rsa with black keys, add curve25519, ecdh
+
+---
+ crypto/cryptodev.h |  16 ++
+ ioctl.c            |   6 +-
+ main.c             | 461 ++++++++++++++++++++++++++++++++++++++++++++-
+ pk_crypto.h        |  83 +++++++-
+ 4 files changed, 562 insertions(+), 4 deletions(-)
+
+diff --git a/crypto/cryptodev.h b/crypto/cryptodev.h
+index 7d6e714..450ab5e 100644
+--- a/crypto/cryptodev.h
++++ b/crypto/cryptodev.h
+@@ -54,6 +54,11 @@ enum cryptodev_crypto_op_t {
+ 	CRYPTO_ASYM_ECDSA_SIGN,
+ 	CRYPTO_ASYM_ECDSA_VERIFY,
+ 	CRYPTO_ASYM_ECC_KEYGEN,		
++	CRYPTO_ASYM_ECC_ECDH,
++	CRYPTO_ASYM_RSA_PRIVATE,
++	CRYPTO_ASYM_RSA_PUBLIC,
++	CRYPTO_ASYM_RSA_KEYGEN,
++	CRYPTO_ASYM_MUL_MOD,
+ 	CRYPTO_ALGORITHM_ALL, /* Keep updated - see below */
+ };
+ 
+@@ -261,6 +266,11 @@ enum cryptodev_crk_op_t {
+ 	CRK_ECDSA_SIGN = 18,
+ 	CRK_ECDSA_VERIFY = 19,
+ 	CRK_ECC_KEYGEN = 20,		
++	CRK_ECC_ECDH = 21,
++	CRK_RSA_PRIVATE = 22,
++	CRK_RSA_PUBLIC = 23,
++	CRK_RSA_KEYGEN = 24,
++	CRK_MUL_MOD = 25,
+ 	CRK_ALGORITHM_ALL
+ };
+ 
+@@ -288,6 +298,10 @@ struct cphash_op {
+ #define CRF_ECDSA_SIGN			(1 << CRK_ECDSA_SIGN)
+ #define CRF_ECDSA_VERIFY		(1 << CRK_ECDSA_VERIFY)
+ #define CRF_ECC_KEYGEN			(1 << CRK_ECC_KEYGEN)
++#define CRF_RSA_PRIVATE         (1 << CRK_RSA_PRIVATE)
++#define CRF_RSA_PUBLIC          (1 << CRK_RSA_PUBLIC)
++#define CRF_RSA_KEYGEN          (1 << CRK_RSA_KEYGEN)
++#define CRF_MUL_MOD             (1 << CRK_MUL_MOD)
+ 
+ #define	CAAM_KEY_COLOR_RED   0
+ #define	CAAM_KEY_COLOR_BLACK 1
+@@ -421,6 +435,8 @@ struct cphash_op {
+ #define CAAM_EC_CURVE_OAKLEY_4 126
+ #define CAAM_EC_CURVE_UNDEFINED	127
+ 
++#define CAAM_MUL_MOD_LE 1
++
+ /* ioctl's. Compatible with old linux cryptodev.h
+  */
+ #define CRIOGET         _IOWR('c', 101, __u32)
+diff --git a/ioctl.c b/ioctl.c
+index 6206040..09610e1 100644
+--- a/ioctl.c
++++ b/ioctl.c
+@@ -885,7 +885,8 @@ cryptodev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg_)
+ 	case CIOCASYMFEAT:
+ 		if( 0 != caam_pk_status())
+ 		{
+-			asymfeat = CRF_ECDSA_SIGN | CRF_ECDSA_VERIFY | CRF_ECC_KEYGEN;
++			asymfeat = CRF_ECDSA_SIGN | CRF_ECDSA_VERIFY | CRF_ECC_KEYGEN |
++                CRF_RSA_PRIVATE | CRF_RSA_PUBLIC | CRF_RSA_KEYGEN;
+ 			return put_user(asymfeat, p);
+ 		}
+ 		else
+@@ -1100,7 +1101,8 @@ cryptodev_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg_)
+ 	case CIOCASYMFEAT:
+ 		if( 0 != caam_pk_status())
+ 		{
+-			asymfeat = CRF_ECDSA_SIGN | CRF_ECDSA_VERIFY | CRF_ECC_KEYGEN;;
++			asymfeat = CRF_ECDSA_SIGN | CRF_ECDSA_VERIFY | CRF_ECC_KEYGEN |
++                CRF_RSA_PUBLIC | CRF_RSA_PRIVATE | CRF_RSA_KEYGEN;
+ 			return put_user(asymfeat, arg);
+ 		}
+ 		else
+diff --git a/main.c b/main.c
+index acc1ae5..2e0e41a 100644
+--- a/main.c
++++ b/main.c
+@@ -267,6 +267,442 @@ out_unlock:
+ 	return ret;
+ }
+ 
++/* returns 0 on success */
++static int do_caam_ecdh(struct crypt_kop *kop)
++{
++    int ret = 0;
++    caam_ecdsa_ecdh_t ecdsa_ecdh;
++    if (unlikely(kop->crk_iparams != 2)) {
++        derr(1, "invalid parameters iparams=0x%08X \n", kop->crk_iparams);
++        ret = -EINVAL;
++        goto end_ecdsa_ecdh;
++    }
++
++    if (unlikely(kop->crk_oparams != 1)) {
++        derr(1, "invalid parameters oparams=0x%08X \n", kop->crk_oparams);
++        ret = -EINVAL;
++        goto end_ecdsa_ecdh;
++    }
++
++    ecdsa_ecdh.key_color = (kop->crk_flags >> 8) & 1;
++    ecdsa_ecdh.curve_id  = kop->crk_flags & 0xFF;
++
++    ret = caam_ecdsa_ecdh_init(&ecdsa_ecdh);
++    if (unlikely(0 != ret)) {
++        derr(1, "caam_ecdsa_ecdh_init error \n");
++        ret = -EFAULT;
++        goto end_ecdsa_ecdh;
++    }
++
++    /* copy over public key */
++    if (unlikely(copy_from_user(ecdsa_ecdh.addr_s, kop->crk_param[0].crp_p,
++        ecdsa_ecdh.curve->data.n_len * 2))) {
++        derr(1, "copy_from_user error s \n");
++        ret = -EFAULT;
++        goto out_ecdsa_ecdh;
++    }
++
++    /* copy over private key */
++    if (unlikely(copy_from_user(ecdsa_ecdh.addr_f, kop->crk_param[1].crp_p,
++        ecdsa_ecdh.curve->data.n_len))) {
++        derr(1, "copy_from_user error f \n");
++        ret = -EFAULT;
++        goto out_ecdsa_ecdh;
++    }
++    ret = caam_ecdsa_ecdh(&ecdsa_ecdh);
++    if (unlikely(0 != ret))
++        derr(1, "ECDSA ecdh error code =0x%08X", ret);
++    else {
++        /* copy out shared secret */
++        if (unlikely(copy_to_user(kop->crk_param[kop->crk_iparams].crp_p,
++            ecdsa_ecdh.addr_c, ecdsa_ecdh.curve->data.n_len)))
++            ret = -EFAULT;
++    }
++
++out_ecdsa_ecdh:
++    caam_ecdsa_ecdh_deinit(&ecdsa_ecdh);
++end_ecdsa_ecdh:
++    return ret;
++}
++
++/* returns 0 on success */
++static int do_caam_rsa_private(struct crypt_kop *kop)
++{
++    caam_rsa_private_t rsa_private;
++    int ret    = 0;
++    int crpIdx = 0;
++
++    memset(&rsa_private, 0, sizeof(caam_rsa_private_t));
++    if (unlikely(kop->crk_iparams < 3)) {
++        derr(1, "invalid parameters iparams=0x%08X \n", kop->crk_iparams);
++        ret = -EINVAL;
++        goto end_rsa_private;
++    }
++
++    if (unlikely(kop->crk_oparams != 1)) {
++        derr(1, "invalid parameters oparams=0x%08X \n", kop->crk_iparams);
++        ret = -EINVAL;
++        goto end_rsa_private;
++    }
++    rsa_private.key_color = (kop->crk_flags >> 8) & 1;
++
++    /* set sizes */
++    rsa_private.g_sz = (kop->crk_param[crpIdx].crp_nbits+7)/8; crpIdx++;
++    switch (kop->crk_iparams) {
++        case 3: /* handle form #1 (n, d) */
++            rsa_private.n_sz = (kop->crk_param[crpIdx].crp_nbits+7)/8; crpIdx++;
++            rsa_private.d_sz = (kop->crk_param[crpIdx].crp_nbits+7)/8; crpIdx++;
++            break;
++
++        case 6: /* handle form #3 (p, q, dp, dq, c) */
++            rsa_private.p_sz  = (kop->crk_param[crpIdx].crp_nbits+7)/8; crpIdx++;
++            rsa_private.q_sz  = (kop->crk_param[crpIdx].crp_nbits+7)/8; crpIdx++;
++            rsa_private.dp_sz = (kop->crk_param[crpIdx].crp_nbits+7)/8; crpIdx++;
++            rsa_private.dq_sz = (kop->crk_param[crpIdx].crp_nbits+7)/8; crpIdx++;
++            rsa_private.c_sz  = (kop->crk_param[crpIdx].crp_nbits+7)/8; crpIdx++;
++            break;
++
++        case 4:
++        case 8:
++            derr(1, "form not yet, supported\n");
++            ret = -EINVAL;
++            goto end_rsa_private;
++    }
++
++    /* last parameter is the output buffer 'f' */
++    rsa_private.f_sz = (kop->crk_param[crpIdx].crp_nbits+7)/8;
++    crpIdx = 0; /* reset index for parsing buffers */
++
++    ret = caam_rsa_private_init(&rsa_private);
++    if (unlikely(0 != ret)) {
++        derr(1, "caam_rsa_private_init error \n");
++        ret = -EFAULT;
++        goto end_rsa_private;
++    }
++
++    /* get input g */
++    if (unlikely(rsa_private.g_sz  > 4096)) {
++        derr(1, "Only supporting up to 4096 bit keys\n");
++        ret = -EFAULT;
++        goto out_rsa_private;
++    }
++    if (unlikely(copy_from_user(rsa_private.addr_g,
++            kop->crk_param[crpIdx].crp_p, rsa_private.g_sz))) {
++        derr(1, "copy_from_user error g \n");
++        ret = -EFAULT;
++        goto out_rsa_private;
++    }
++    crpIdx++;
++
++    /* There is 4 forms of private key
++     * #1 (n, d)
++     * #2 (p, q, d)
++     * #3 (p, q, dp, dq, c)
++     * #4 (p, q, dp, dq, cR, RRp, RRq) */
++    switch (kop->crk_iparams) {
++        case 3: /* handle form #1 (n, d) */
++            /* check and copy over n value */
++            if (unlikely(rsa_private.n_sz  > 4096)) {
++                derr(1, "Only supporting up to 4096 bit keys\n");
++                ret = -EFAULT;
++                goto out_rsa_private;
++            }
++            if (unlikely(copy_from_user(rsa_private.addr_n,
++                    kop->crk_param[crpIdx].crp_p, rsa_private.n_sz))) {
++                derr(1, "copy_from_user error n \n");
++                ret = -EFAULT;
++                goto out_rsa_private;
++            }
++            crpIdx++;
++
++            /* check and copy over d value */
++            if (unlikely(rsa_private.d_sz > 4096)) {
++                derr(1, "Only supporting up to 4096 bit keys\n");
++                ret = -EFAULT;
++                goto out_rsa_private;
++            }
++            if (unlikely(copy_from_user(rsa_private.addr_d,
++                    kop->crk_param[crpIdx].crp_p, rsa_private.d_sz))) {
++                derr(1, "copy_from_user error d\n");
++                ret = -EFAULT;
++                goto out_rsa_private;
++            }
++            crpIdx++;
++            break;
++
++        case 6: /* handle form #3 (p, q, dp, dq, c) */
++            if (unlikely(copy_from_user(rsa_private.addr_p,
++                    kop->crk_param[crpIdx].crp_p, rsa_private.p_sz))) {
++                derr(1, "copy_from_user error p\n");
++                ret = -EFAULT;
++                goto out_rsa_private;
++            }
++            crpIdx++;
++
++            if (unlikely(copy_from_user(rsa_private.addr_q,
++                    kop->crk_param[crpIdx].crp_p, rsa_private.q_sz))) {
++                derr(1, "copy_from_user error q\n");
++                ret = -EFAULT;
++                goto out_rsa_private;
++            }
++            crpIdx++;
++
++            if (unlikely(copy_from_user(rsa_private.addr_dp,
++                    kop->crk_param[crpIdx].crp_p, rsa_private.dp_sz))) {
++                derr(1, "copy_from_user error dp\n");
++                ret = -EFAULT;
++                goto out_rsa_private;
++            }
++            crpIdx++;
++
++            if (unlikely(copy_from_user(rsa_private.addr_dq,
++                    kop->crk_param[crpIdx].crp_p, rsa_private.dq_sz))) {
++                derr(1, "copy_from_user error dq\n");
++                ret = -EFAULT;
++                goto out_rsa_private;
++            }
++            crpIdx++;
++
++            if (unlikely(copy_from_user(rsa_private.addr_c,
++                    kop->crk_param[crpIdx].crp_p, rsa_private.c_sz))) {
++                derr(1, "copy_from_user error c\n");
++                ret = -EFAULT;
++                goto out_rsa_private;
++            }
++            crpIdx++;
++            break;
++
++        case 4:
++        case 8:
++            derr(1, "form not yet, supported\n");
++            ret = -EINVAL;
++            goto out_rsa_private;
++    }
++
++    ret = caam_rsa_private(&rsa_private);
++    if (unlikely(0 != ret)) {
++        derr(1, "RSA private error code =0x%08X", ret);
++    }
++    else {
++        /* write out result f */
++        if (unlikely(copy_to_user(kop->crk_param[crpIdx].crp_p,
++                rsa_private.addr_f, rsa_private.f_sz))) {
++            ret = -EFAULT;
++        }
++    }
++out_rsa_private:
++    caam_rsa_private_deinit(&rsa_private);
++end_rsa_private:
++    return ret;
++}
++
++
++/* returns 0 on success */
++static int do_caam_rsa_public(struct crypt_kop *kop)
++{
++    caam_rsa_public_t rsa_public;
++    int ret    = 0;
++    int crpIdx = 0;
++
++    memset(&rsa_public, 0, sizeof(caam_rsa_public_t));
++    if (unlikely(kop->crk_iparams != 3)) {
++        derr(1, "invalid parameters iparams=0x%08X \n", kop->crk_iparams);
++        ret = -EINVAL;
++        goto end_rsa_public;
++    }
++    if (unlikely(kop->crk_oparams != 1)) {
++        derr(1, "invalid parameters oparams=0x%08X \n", kop->crk_iparams);
++        ret = -EINVAL;
++        goto end_rsa_public;
++    }
++
++    rsa_public.key_color = (kop->crk_flags >> 8) & 1;
++    rsa_public.f_sz = (kop->crk_param[0].crp_nbits+7)/8;
++    rsa_public.n_sz = (kop->crk_param[1].crp_nbits+7)/8;
++    rsa_public.e_sz = (kop->crk_param[2].crp_nbits+7)/8;
++    rsa_public.g_sz = (kop->crk_param[3].crp_nbits+7)/8;
++    ret = caam_rsa_public_init(&rsa_public);
++    if (unlikely(0 != ret)) {
++        derr(1, "caam_rsa_public_init error \n");
++        ret = -EFAULT;
++        goto end_rsa_public;
++    }
++
++
++    if (unlikely(copy_from_user(rsa_public.addr_f, kop->crk_param[crpIdx].crp_p,
++            rsa_public.f_sz))) {
++        derr(1, "copy_from_user error w \n");
++        ret = -EFAULT;
++        goto out_rsa_public;
++    }
++    crpIdx++;
++
++    if (unlikely(copy_from_user(rsa_public.addr_n, kop->crk_param[crpIdx].crp_p,
++            rsa_public.n_sz))) {
++        derr(1, "copy_from_user error n \n");
++        ret = -EFAULT;
++        goto out_rsa_public;
++    }
++    crpIdx++;
++
++    if (unlikely(copy_from_user(rsa_public.addr_e, kop->crk_param[crpIdx].crp_p,
++            rsa_public.e_sz))) {
++        derr(1, "copy_from_user error e \n");
++        ret = -EFAULT;
++        goto out_rsa_public;
++    }
++    crpIdx++;
++
++    ret = caam_rsa_public(&rsa_public);
++    if (unlikely(0 != ret)) {
++        derr(1, "RSA public error code =0x%08X", ret);
++    }
++    else {
++        /* write out result g */
++        if (unlikely(copy_to_user(kop->crk_param[crpIdx].crp_p,
++            rsa_public.addr_g, rsa_public.g_sz))) {
++            ret = -EFAULT;
++        }
++    }
++
++out_rsa_public:
++    caam_rsa_public_deinit(&rsa_public);
++end_rsa_public:
++    return ret;
++}
++
++/* returns 0 on success */
++static int do_caam_rsa_keygen(struct crypt_kop *kop)
++{
++    caam_rsa_keygen_t rsa_keygen;
++    int ret    = 0;
++    int crpIdx = 0;
++
++    memset(&rsa_keygen, 0, sizeof(caam_rsa_keygen_t));
++    rsa_keygen.e_sz = (kop->crk_param[crpIdx].crp_nbits + 7)/8; crpIdx++;
++    rsa_keygen.p_sz = (kop->crk_param[crpIdx].crp_nbits + 7)/8; crpIdx++;
++    rsa_keygen.q_sz = (kop->crk_param[crpIdx].crp_nbits + 7)/8; crpIdx++;
++    rsa_keygen.n_sz = (kop->crk_param[crpIdx].crp_nbits + 7)/8; crpIdx++;
++    if (unlikely(rsa_keygen.n_sz > 4096)) {
++        derr(1, "RSA key size is too large\n");
++        goto end_rsa_keygen;
++    }
++    rsa_keygen.d_sz = (kop->crk_param[crpIdx].crp_nbits + 7)/8; crpIdx++;
++
++    /* possible dp / dq / c if is form 3 */
++    if (kop->crk_oparams == 7) {
++        rsa_keygen.dp_sz = (kop->crk_param[crpIdx].crp_nbits + 7)/8; crpIdx++;
++        rsa_keygen.dq_sz = (kop->crk_param[crpIdx].crp_nbits + 7)/8; crpIdx++;
++        rsa_keygen.c_sz  = (kop->crk_param[crpIdx].crp_nbits + 7)/8; crpIdx++;
++    }
++    rsa_keygen.dSz_sz = 4; /* save 4 bytes for output */
++    rsa_keygen.key_color = (kop->crk_flags >> 8) & 1;
++
++    ret = caam_rsa_keygen_init(&rsa_keygen);
++    if (unlikely(0 != ret)) {
++        derr(1, "caam_rsa_keygen_init error\n");
++        ret = -EFAULT;
++        goto end_rsa_keygen;
++    }
++
++    if (unlikely(copy_from_user(rsa_keygen.addr_e, kop->crk_param[0].crp_p,
++            rsa_keygen.e_sz))) {
++        ret = -EFAULT;
++        goto out_rsa_keygen;
++    }
++
++    if (unlikely(copy_from_user(rsa_keygen.addr_p, kop->crk_param[1].crp_p,
++            rsa_keygen.p_sz))) {
++        ret = -EFAULT;
++        goto out_rsa_keygen;
++    }
++
++    if (unlikely(copy_from_user(rsa_keygen.addr_q, kop->crk_param[2].crp_p,
++            rsa_keygen.q_sz))) {
++        ret = -EFAULT;
++        goto out_rsa_keygen;
++    }
++
++    ret = caam_rsa_keygen(&rsa_keygen);
++    if (unlikely(0 != ret)) {
++        derr(1, "RSA keygen error code =0x%08X", ret);
++    }
++    else {
++        /* copy out the results generated */
++        if (unlikely(copy_to_user(kop->crk_param[3].crp_p, rsa_keygen.addr_n,
++                rsa_keygen.n_sz))) {
++            ret = -EFAULT;
++            goto out_rsa_keygen;
++        }
++
++        if (unlikely(copy_to_user(kop->crk_param[4].crp_p, rsa_keygen.addr_d,
++                rsa_keygen.d_sz))) {
++            ret = -EFAULT;
++            goto out_rsa_keygen;
++        }
++
++        /* possible dp / dq / c if is form 3 */
++        if (kop->crk_oparams == 7) {
++            if (unlikely(copy_to_user(kop->crk_param[5].crp_p,
++                    rsa_keygen.addr_dp, rsa_keygen.dp_sz))) {
++                ret = -EFAULT;
++                goto out_rsa_keygen;
++            }
++
++            if (unlikely(copy_to_user(kop->crk_param[6].crp_p,
++                    rsa_keygen.addr_dq, rsa_keygen.dq_sz))) {
++                ret = -EFAULT;
++                goto out_rsa_keygen;
++            }
++
++            if (unlikely(copy_to_user(kop->crk_param[7].crp_p,
++                    rsa_keygen.addr_c, rsa_keygen.c_sz))) {
++                ret = -EFAULT;
++            }
++        }
++    }
++out_rsa_keygen:
++    caam_rsa_keygen_deinit(&rsa_keygen);
++end_rsa_keygen:
++    return ret;
++}
++
++
++static int do_mul_mod(struct crypt_kop *kop)
++{
++    int ret;
++    uint16_t aSz, kSz, nSz, a24Sz, outSz;
++    unsigned char outLittleEndian = 0;
++
++    if (unlikely(kop->crk_iparams != 4)) {
++        derr(1, "invalid parameters iparams=0x%08X \n", kop->crk_iparams);
++        ret = -EINVAL;
++        goto end_do_mul_mod;
++    }
++
++    if (unlikely(kop->crk_oparams != 1)) {
++        derr(1, "invalid parameters oparams=0x%08X \n", kop->crk_oparams);
++        ret = -EINVAL;
++        goto end_do_mul_mod;
++    }
++
++    kSz   = (kop->crk_param[0].crp_nbits+7)/8;
++    aSz   = (kop->crk_param[1].crp_nbits+7)/8;
++    nSz   = (kop->crk_param[2].crp_nbits+7)/8;
++    a24Sz = (kop->crk_param[3].crp_nbits+7)/8;
++    outSz = (kop->crk_param[4].crp_nbits+7)/8;
++
++    outLittleEndian = kop->crk_flags & CAAM_MUL_MOD_LE;
++    ret = caam_mul_mod(kop->crk_param[0].crp_p, kSz,
++                        kop->crk_param[1].crp_p, aSz,
++                        kop->crk_param[2].crp_p, nSz,
++                        kop->crk_param[3].crp_p, a24Sz,
++                        kop->crk_param[4].crp_p, outSz,
++                        outLittleEndian);
++end_do_mul_mod:
++    return ret;
++}
++
+ int crypto_pk_run(struct fcrypt *fcr, struct kernel_crypt_kop *kckop)
+ {
+ 	struct csession *ses_ptr = NULL;
+@@ -305,6 +741,7 @@ int crypto_pk_run(struct fcrypt *fcr, struct kernel_crypt_kop *kckop)
+ 				ecdsa_sign.key_color = (kop->crk_flags >> 8) & 1;
+ 				ecdsa_sign.curve_id = kop->crk_flags & 0xFF;
+ 
++				ecdsa_sign.f_sz = (kop->crk_param[1].crp_nbits+7)/8;
+ 				ret = caam_ecdsa_sign_init(&ecdsa_sign);
+ 				if(unlikely(0 != ret)) {
+ 					derr(1, "caam_ecdsa_sign_init error \n");
+@@ -349,7 +786,7 @@ int crypto_pk_run(struct fcrypt *fcr, struct kernel_crypt_kop *kckop)
+ 
+ 				ecdsa_verify.key_color = (kop->crk_flags >> 8) & 1;
+ 				ecdsa_verify.curve_id = kop->crk_flags & 0xFF;
+-
++                ecdsa_verify.f_sz = (kop->crk_param[1].crp_nbits+7)/8;
+ 				ret = caam_ecdsa_verify_init(&ecdsa_verify);
+ 				if(unlikely(0 != ret)) {
+ 					derr(1, "caam_ecdsa_verify_init error \n");
+@@ -416,7 +853,29 @@ int crypto_pk_run(struct fcrypt *fcr, struct kernel_crypt_kop *kckop)
+ 				caam_ecdsa_keygen_deinit(&ecdsa_keygen);
+ 			}
+ 			break;
++        case CRK_ECC_ECDH:
++            ret = do_caam_ecdh(kop);
++            break;
++
++	    case CRK_RSA_PRIVATE:
++            ret = do_caam_rsa_private(kop);
++            break;
++
++	    case CRK_RSA_PUBLIC:
++            ret = do_caam_rsa_public(kop);
++            break;
++
++	    case CRK_RSA_KEYGEN:
++            ret = do_caam_rsa_keygen(kop);
++            break;
++
++        case CRK_MUL_MOD:
++            ret = do_mul_mod(kop);
++            break;
+ 
++        default:
++            derr(1, "Unknown PK type");
++		    ret = -EFAULT;
+ 		}
+ 	}
+ out_unlock:
+diff --git a/pk_crypto.h b/pk_crypto.h
+index 999ad62..339da04 100644
+--- a/pk_crypto.h
++++ b/pk_crypto.h
+@@ -33,11 +33,12 @@ typedef struct {
+ 	dma_addr_t phy_addr_f;
+ 	dma_addr_t phy_addr_c;
+ 	dma_addr_t phy_addr_d;
++	size_t f_sz;
+ 	u32 curve_id;
+ 	const ec_curve_t *curve;
+ 	u8 key_color;
+ 	u32 *desc;
+-} caam_ecdsa_sign_t;
++} caam_ecdsa_sign_t, caam_ecdsa_ecdh_t;
+ 
+ typedef struct {
+ 	u8 *addr_w;
+@@ -51,6 +52,7 @@ typedef struct {
+ 	dma_addr_t phy_addr_c;
+ 	dma_addr_t phy_addr_d;
+ 	dma_addr_t phy_addr_tmp;
++	size_t f_sz;
+ 	u32 curve_id;
+ 	const ec_curve_t *curve;
+ 	u8 	key_color;
+@@ -69,6 +71,67 @@ typedef struct {
+ } caam_ecdsa_keygen_t;
+ 
+ 
++/* CAAM RSA PDB */
++typedef struct {
++	u8 *addr_f; /* input message */
++	u8 *addr_g; /* result of rsa operation */
++	u8 *addr_n; /* public modulus */
++	u8 *addr_e; /* rsa exponent */
++	dma_addr_t phy_addr_f;
++	dma_addr_t phy_addr_g;
++	dma_addr_t phy_addr_n;
++	dma_addr_t phy_addr_e;
++	size_t f_sz;
++	size_t g_sz;
++	size_t n_sz;
++	size_t e_sz;
++	u8 key_color;
++	u32 *desc;
++} caam_rsa_public_t;
++
++typedef struct {
++	u8 *addr_g; /* input value */
++	u8 *addr_f; /* decrypted output value */
++	u8 *addr_n; /* n depending on the form used */
++	u8 *addr_d; /* private key, can be null depending on form used */
++	u8 *addr_p; /* prime value from key */
++	u8 *addr_q; /* prime value from key */
++	u8 *addr_dp; /* CRT values */
++	u8 *addr_dq;
++	u8 *addr_c;
++	u8 *addr_e; /* exponent for keygen */
++	u8 *addr_dSz; /* output of 'd' size with keygen */
++	u8 *addr_tmpp; /* used with form 3 */
++	u8 *addr_tmpq; /* used with form 3 */
++	dma_addr_t phy_addr_g;
++	dma_addr_t phy_addr_f;
++	dma_addr_t phy_addr_n;
++	dma_addr_t phy_addr_d;
++	dma_addr_t phy_addr_p;
++	dma_addr_t phy_addr_q;
++	dma_addr_t phy_addr_dp;
++	dma_addr_t phy_addr_dq;
++	dma_addr_t phy_addr_c;
++	dma_addr_t phy_addr_e;
++	dma_addr_t phy_addr_dSz;
++	dma_addr_t phy_addr_tmpp; /* used with form 3 */
++	dma_addr_t phy_addr_tmpq; /* used with form 3 */
++	size_t g_sz;
++	size_t f_sz;
++	size_t n_sz;
++	size_t d_sz;
++	size_t p_sz;
++	size_t q_sz;
++	size_t dp_sz;
++	size_t dq_sz;
++	size_t c_sz;
++	size_t e_sz;
++	size_t dSz_sz;
++	u8	key_color;
++	u32 *desc;
++} caam_rsa_private_t, caam_rsa_keygen_t;
++
++
+ int caam_pk_status(void);
+ struct device *caam_ecdsa_get_jrdev(void);
+ 
+@@ -82,6 +145,24 @@ int caam_ecdsa_verify(caam_ecdsa_verify_t *ecdsa_verify);
+ int caam_ecdsa_keygen_init(caam_ecdsa_keygen_t *ecdsa_keygen);
+ int caam_ecdsa_keygen_deinit(caam_ecdsa_keygen_t *ecdsa_keygen);
+ int caam_ecdsa_keygen(caam_ecdsa_keygen_t *ecdsa_keygen);
++int caam_ecdsa_ecdh_init(caam_ecdsa_ecdh_t *ecdsa_ecdh);
++int caam_ecdsa_ecdh_deinit(caam_ecdsa_ecdh_t *ecdsa_ecdh);
++int caam_ecdsa_ecdh(caam_ecdsa_ecdh_t *ecdsa_ecdh);
++
++/* CAAM RSA primitives */
++int caam_rsa_private_init(caam_rsa_private_t *rsa_private);
++int caam_rsa_private_deinit(caam_rsa_private_t *rsa_private);
++int caam_rsa_private(caam_rsa_private_t *rsa_private);
++int caam_rsa_public_init(caam_rsa_public_t *rsa_public);
++int caam_rsa_public_deinit(caam_rsa_public_t *rsa_public);
++int caam_rsa_public(caam_rsa_public_t *rsa_public);
++int caam_rsa_keygen_init(caam_rsa_keygen_t *rsa_keygen);
++int caam_rsa_keygen_deinit(caam_rsa_keygen_t *rsa_keygen);
++int caam_rsa_keygen(caam_rsa_keygen_t *rsa_keygen);
+ 
++/* PKHA */
++int caam_mul_mod(u8 *k, uint16_t kSz, u8 *a, uint16_t aSz, u8 *n,
++    uint16_t nSz, u8 *a24, uint16_t a24Sz, u8 *out, uint16_t outSz,
++    unsigned char outLE);
+ #endif /* PK_CRYPTO_H */
+ 

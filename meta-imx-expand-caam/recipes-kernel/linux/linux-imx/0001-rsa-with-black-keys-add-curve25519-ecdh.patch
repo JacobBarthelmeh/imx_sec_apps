@@ -1,0 +1,1199 @@
+From 7a8b2a75ac5ef9bd5da3eb35c5bb5513298c9985 Mon Sep 17 00:00:00 2001
+From: JacobBarthelmeh <jacob@wolfssl.com>
+Date: Thu, 17 Feb 2022 09:45:10 -0800
+Subject: [PATCH] rsa with black keys, add curve25519, ecdh
+
+---
+ drivers/crypto/caam/caampkc.c | 753 ++++++++++++++++++++++++++++++++--
+ drivers/crypto/caam/caampkc.h |  82 +++-
+ drivers/crypto/caam/desc.h    |  16 +
+ drivers/crypto/caam/pdb.h     |   2 +
+ 4 files changed, 808 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/crypto/caam/caampkc.c b/drivers/crypto/caam/caampkc.c
+index 64116353aae5..b1af2cc62503 100644
+--- a/drivers/crypto/caam/caampkc.c
++++ b/drivers/crypto/caam/caampkc.c
+@@ -36,6 +36,10 @@
+ 
+ /* ECDSA Protocol Data Block */
+ #define CAAM_PROTINFO_SEC_KEY	(0x01 << 2)
++/* RSA Protocol Data Block */
++#define CAAM_PROTINFO_RSA_KEYGEN_SEC_KEY	(0x01 << 6)
++/* RSA Protocol Data Block */
++#define CAAM_PROTINFO_RSA_PRIVATE_SEC_KEY	(0x01 << 8)
+ /* ECB-encrypted key
+  * The bit is ignored for signature verification because only public
+  * keys are used.
+@@ -56,6 +60,7 @@
+ /* ECC binary field (F2M) */
+ #define ECC_DOMAIN_F2M			1
+ 
++#define SIZEOF_ECDSA_ECDH_PDB (CAAM_CMD_SZ + 3 * CAAM_PTR_SZ)
+ #define SIZEOF_ECDSA_KEYGEN_PDB (CAAM_CMD_SZ + 2 * CAAM_PTR_SZ)
+ #define SIZEOF_ECDSA_SIGN_PDB (CAAM_CMD_SZ + 4 * CAAM_PTR_SZ)
+ #define SIZEOF_ECDSA_VERIFY_PDB (CAAM_CMD_SZ + 5 * CAAM_PTR_SZ)
+@@ -193,7 +198,7 @@ static const ec_curve_t caam_ec_curve_list[] = {
+ };
+ 
+ /* pk per-device context */
+-struct caam_ecdsa_ctx_t {
++struct caam_pka_ctx_t {
+ 	struct device *jrdev;
+ };
+ 
+@@ -202,7 +207,7 @@ struct caam_operation_result {
+ 	int err;
+ };
+ 
+-static struct caam_ecdsa_ctx_t *caam_ecdsa_ctx;
++static struct caam_pka_ctx_t *caam_pka_ctx;
+ 
+ /* buffer filled with zeros, used for padding */
+ static u8 *zero_buffer;
+@@ -1326,11 +1331,396 @@ static struct caam_akcipher_alg caam_rsa = {
+ 	}
+ };
+ 
++
++/* creates buffer and maps structure pointers, returns 0 on success */
++int caam_rsa_private_init(caam_rsa_private_t *rsa_private)
++{
++    struct device *jrdev = caam_pka_ctx->jrdev;
++    int ret = 0;
++    size_t total_len;
++
++    rsa_private->desc = kmalloc(MAX_CAAM_DESCSIZE * sizeof(u32),
++        GFP_KERNEL | GFP_DMA);
++    if (unlikely(!rsa_private->desc))
++        goto desc_alloc_fail;
++
++    /* alloc a coherent buffer large enough for all values */
++    total_len = rsa_private->g_sz + rsa_private->f_sz + rsa_private->n_sz +
++        rsa_private->d_sz + rsa_private->p_sz + rsa_private->q_sz +
++        rsa_private->dp_sz + rsa_private->dq_sz + rsa_private->c_sz;
++    if (rsa_private->dp_sz > 0) { /* add in size of tmpp tmpq for form 3 */
++        total_len += rsa_private->q_sz + rsa_private->p_sz;
++    }
++    rsa_private->addr_g = dma_alloc_coherent(jrdev, total_len,
++        &rsa_private->phy_addr_g, GFP_KERNEL | GFP_DMA);
++    if (unlikely(!rsa_private->addr_g))
++        goto g_alloc_fail;
++
++    /* map each pointer of the structure to a section of the buffer */
++    memset(rsa_private->addr_g, 0, total_len);
++    rsa_private->addr_f     = rsa_private->addr_g     + rsa_private->g_sz;
++    rsa_private->phy_addr_f = rsa_private->phy_addr_g + rsa_private->g_sz;
++    rsa_private->addr_n     = rsa_private->addr_f     + rsa_private->f_sz;
++    rsa_private->phy_addr_n = rsa_private->phy_addr_f + rsa_private->f_sz;
++    rsa_private->addr_d     = rsa_private->addr_n     + rsa_private->n_sz;
++    rsa_private->phy_addr_d = rsa_private->phy_addr_n + rsa_private->n_sz;
++    rsa_private->addr_c     = rsa_private->addr_d     + rsa_private->d_sz;
++    rsa_private->phy_addr_c = rsa_private->phy_addr_d + rsa_private->d_sz;
++    rsa_private->addr_p     = rsa_private->addr_c     + rsa_private->c_sz;
++    rsa_private->phy_addr_p = rsa_private->phy_addr_c + rsa_private->c_sz;
++    rsa_private->addr_q     = rsa_private->addr_p     + rsa_private->p_sz;
++    rsa_private->phy_addr_q = rsa_private->phy_addr_p + rsa_private->p_sz;
++    rsa_private->addr_dp    = rsa_private->addr_q     + rsa_private->q_sz;
++    rsa_private->phy_addr_dp= rsa_private->phy_addr_q + rsa_private->q_sz;
++    rsa_private->addr_dq    = rsa_private->addr_dp    + rsa_private->dp_sz;
++    rsa_private->phy_addr_dq= rsa_private->phy_addr_dp + rsa_private->dp_sz;
++    if (rsa_private->dp_sz > 0) { /* add in tmpp tmpq for form 3 */
++        rsa_private->addr_tmpp     = rsa_private->addr_dq     + rsa_private->dq_sz;
++        rsa_private->phy_addr_tmpp = rsa_private->phy_addr_dq + rsa_private->dq_sz;
++        rsa_private->addr_tmpq     = rsa_private->addr_tmpp     + rsa_private->p_sz;
++        rsa_private->phy_addr_tmpq = rsa_private->phy_addr_tmpp + rsa_private->p_sz;
++    }
++
++    return ret;
++g_alloc_fail:
++    kfree(rsa_private->desc);
++desc_alloc_fail:
++    return -ENOMEM;
++}
++EXPORT_SYMBOL(caam_rsa_private_init);
++
++
++/* free's buffer, returns 0 on success */
++int caam_rsa_private_deinit(caam_rsa_private_t *rsa_private)
++{
++    size_t total_len;
++    struct device *jrdev = caam_pka_ctx->jrdev;
++
++    total_len = rsa_private->g_sz + rsa_private->f_sz + rsa_private->n_sz +
++        rsa_private->d_sz + rsa_private->p_sz + rsa_private->q_sz +
++        rsa_private->dp_sz + rsa_private->dq_sz + rsa_private->c_sz;
++    if (rsa_private->dp_sz > 0) { /* add in size of tmpp tmpq for form 3 */
++        total_len += rsa_private->q_sz + rsa_private->p_sz;
++    }
++    dma_free_coherent(jrdev, total_len, (void*)rsa_private->addr_g,
++        rsa_private->phy_addr_g);
++    kfree(rsa_private->desc);
++	return 0;
++}
++EXPORT_SYMBOL(caam_rsa_private_deinit);
++
++static void caam_rsa_private_jobdesc(u32 *desc, caam_rsa_private_t *rsa_private)
++{
++    u32 op  = 0;
++    u32 sgf = 0;
++    u32 pdbSz = SIZEOF_RSA_PRIV_F1_PDB;
++
++    if (rsa_private->dp_sz > 0) {
++        pdbSz = SIZEOF_RSA_PRIV_F3_PDB;
++        sgf   = rsa_private->g_sz & 0xfff; /* only supporting raw RSA input size
++                                            * will be the same length as n */
++    }
++    else {
++        sgf  = rsa_private->n_sz & 0xfff;
++        sgf |= ((rsa_private->d_sz & 0xfff) << RSA_PDB_D_SHIFT);
++    }
++
++    init_job_desc_pdb(desc, 0, pdbSz);
++    append_cmd(desc, sgf);
++    append_ptr(desc, rsa_private->phy_addr_g);
++    append_ptr(desc, rsa_private->phy_addr_f);
++    if (pdbSz == SIZEOF_RSA_PRIV_F1_PDB) {
++        append_ptr(desc, rsa_private->phy_addr_n);
++        append_ptr(desc, rsa_private->phy_addr_d);
++    }
++    if (pdbSz == SIZEOF_RSA_PRIV_F3_PDB) {
++        append_ptr(desc, rsa_private->phy_addr_c);
++        append_ptr(desc, rsa_private->phy_addr_p);
++        append_ptr(desc, rsa_private->phy_addr_q);
++        append_ptr(desc, rsa_private->phy_addr_dp);
++        append_ptr(desc, rsa_private->phy_addr_dq);
++        append_ptr(desc, rsa_private->phy_addr_tmpp);
++        append_ptr(desc, rsa_private->phy_addr_tmpq);
++    }
++
++    op = (OP_TYPE_UNI_PROTOCOL | OP_PCLID_RSADEC_PRVKEY);
++    if (pdbSz == SIZEOF_RSA_PRIV_F1_PDB) {
++        op |= RSA_PRIV_KEY_FRM_1;
++    }
++    else if (pdbSz == SIZEOF_RSA_PRIV_F3_PDB) {
++        append_cmd(desc, ((rsa_private->q_sz & 0xfff) << RSA_PDB_Q_SHIFT)
++            | (rsa_private->p_sz & 0xfff));
++        op |= RSA_PRIV_KEY_FRM_3;
++    }
++    else {
++        pr_err("Form 2/4 not handled yet");
++    }
++
++    /* set if the private key is black key (ECB encrypted) */
++    if (rsa_private->key_color) {
++        op |= CAAM_PROTINFO_RSA_PRIVATE_SEC_KEY;
++    }
++    append_operation(desc, op);
++
++    /* sync input values */
++    dma_sync_single_for_device(caam_pka_ctx->jrdev, rsa_private->phy_addr_g,
++        rsa_private->g_sz, DMA_TO_DEVICE);
++    dma_sync_single_for_device(caam_pka_ctx->jrdev, rsa_private->phy_addr_n,
++        rsa_private->n_sz + rsa_private->d_sz + rsa_private->p_sz +
++        rsa_private->q_sz + rsa_private->dp_sz + rsa_private->dq_sz +
++        rsa_private->c_sz, DMA_TO_DEVICE);
++}
++
++int caam_rsa_private(caam_rsa_private_t *rsa_private)
++{
++	struct device *jrdev = caam_pka_ctx->jrdev;
++	u32 *desc = rsa_private->desc;
++    struct caam_operation_result res;
++	int ret = 0;
++
++    memset(desc, 0, MAX_CAAM_DESCSIZE * sizeof(u32));
++    caam_rsa_private_jobdesc(desc, rsa_private);
++
++    res.err = 0;
++    init_completion(&res.completion);
++    ret = caam_jr_enqueue(jrdev, desc, caam_operation_done, &res);
++    if (ret == -EINPROGRESS) {
++        wait_for_completion(&res.completion);
++        ret = res.err;
++    }
++
++    /* sync the results of private key operation */
++    dma_sync_single_for_cpu(jrdev, rsa_private->phy_addr_f, rsa_private->f_sz,
++        DMA_FROM_DEVICE);
++    return ret;
++}
++EXPORT_SYMBOL(caam_rsa_private);
++
++int caam_rsa_public_init(caam_rsa_public_t *rsa_public)
++{
++    struct device *jrdev = caam_pka_ctx->jrdev;
++    int ret = 0;
++    size_t total_len;
++
++    rsa_public->desc = kmalloc(MAX_CAAM_DESCSIZE * sizeof(u32),
++        GFP_KERNEL | GFP_DMA);
++    if (unlikely(!rsa_public->desc))
++        goto desc_alloc_fail;
++
++    /* create a coherent buffer for all */
++    total_len = rsa_public->f_sz + rsa_public->g_sz + rsa_public->n_sz +
++        rsa_public->e_sz;
++    rsa_public->addr_f = dma_alloc_coherent(jrdev, total_len,
++        &rsa_public->phy_addr_f, GFP_KERNEL | GFP_DMA);
++    if (unlikely(!rsa_public->addr_f))
++        goto f_alloc_fail;
++
++    /* map structure pointer to locations in buffer */
++    memset(rsa_public->addr_f, 0, total_len);
++    rsa_public->addr_n     = rsa_public->addr_f     + rsa_public->f_sz;
++    rsa_public->phy_addr_n = rsa_public->phy_addr_f + rsa_public->f_sz;
++    rsa_public->addr_e     = rsa_public->addr_n     + rsa_public->n_sz;
++    rsa_public->phy_addr_e = rsa_public->phy_addr_n + rsa_public->n_sz;
++    rsa_public->addr_g     = rsa_public->addr_e     + rsa_public->e_sz;
++    rsa_public->phy_addr_g = rsa_public->phy_addr_e + rsa_public->e_sz;
++
++    return ret;
++
++f_alloc_fail:
++    kfree(rsa_public->desc);
++desc_alloc_fail:
++    return -ENOMEM;
++}
++EXPORT_SYMBOL(caam_rsa_public_init);
++
++int caam_rsa_public_deinit(caam_rsa_public_t *rsa_public)
++{
++	struct device *jrdev = caam_pka_ctx->jrdev;
++
++	dma_free_coherent(jrdev, rsa_public->f_sz + rsa_public->g_sz +
++            rsa_public->n_sz + rsa_public->e_sz, (void *)rsa_public->addr_f,
++			rsa_public->phy_addr_f);
++	kfree(rsa_public->desc);
++
++	return 0;
++}
++EXPORT_SYMBOL(caam_rsa_public_deinit);
++
++static void caam_rsa_public_jobdesc(u32 *desc, caam_rsa_public_t *rsa_public)
++{
++    u32 op = 0;
++
++    init_job_desc_pdb(desc, 0, SIZEOF_RSA_PUB_PDB);
++    append_cmd(desc, ((rsa_public->e_sz & 0xfff) << RSA_PDB_E_SHIFT)
++        | (rsa_public->n_sz & 0xfff));
++
++    append_ptr(desc, rsa_public->phy_addr_f);
++    append_ptr(desc, rsa_public->phy_addr_g);
++    append_ptr(desc, rsa_public->phy_addr_n);
++    append_ptr(desc, rsa_public->phy_addr_e);
++    append_cmd(desc, rsa_public->f_sz);
++    op |= (OP_TYPE_UNI_PROTOCOL | OP_PCLID_RSAENC_PUBKEY);
++    append_operation(desc, op);
++
++    dma_sync_single_for_device(caam_pka_ctx->jrdev,
++        rsa_public->phy_addr_f, rsa_public->f_sz + rsa_public->n_sz +
++        rsa_public->e_sz, DMA_TO_DEVICE);
++}
++
++int caam_rsa_public(caam_rsa_public_t *rsa_public)
++{
++    struct device *jrdev = caam_pka_ctx->jrdev;
++    u32 *desc = rsa_public->desc;
++    struct caam_operation_result res;
++
++    memset(desc, 0, MAX_CAAM_DESCSIZE * sizeof(u32));
++    caam_rsa_public_jobdesc(desc, rsa_public);
++
++    res.err = 0;
++    init_completion(&res.completion);
++
++    if (caam_jr_enqueue(jrdev, desc, caam_operation_done, &res)
++            == -EINPROGRESS) {
++        wait_for_completion(&res.completion);
++    }
++
++    return res.err;
++}
++EXPORT_SYMBOL(caam_rsa_public);
++
++int caam_rsa_keygen_init(caam_rsa_keygen_t *rsa_keygen)
++{
++    struct device *jrdev = caam_pka_ctx->jrdev;
++    int ret = 0;
++    size_t total_len;
++
++    rsa_keygen->desc = kmalloc(MAX_CAAM_DESCSIZE * sizeof(u32),
++        GFP_KERNEL | GFP_DMA);
++    if (unlikely(!rsa_keygen->desc))
++        goto desc_alloc_fail;
++
++    /* create buffer for all */
++    total_len = rsa_keygen->g_sz + rsa_keygen->f_sz + rsa_keygen->n_sz +
++        rsa_keygen->d_sz + rsa_keygen->p_sz + rsa_keygen->q_sz +
++        rsa_keygen->dp_sz + rsa_keygen->dq_sz + rsa_keygen->c_sz +
++        rsa_keygen->dSz_sz;
++    rsa_keygen->addr_p = dma_alloc_coherent(jrdev, total_len,
++        &rsa_keygen->phy_addr_p, GFP_KERNEL | GFP_DMA);
++    if (unlikely(!rsa_keygen->addr_p))
++        goto g_alloc_fail;
++
++    /* map structure pointers to location in buffer */
++    memset(rsa_keygen->addr_p, 0, total_len);
++    rsa_keygen->addr_q     = rsa_keygen->addr_p     + rsa_keygen->p_sz;
++    rsa_keygen->phy_addr_q = rsa_keygen->phy_addr_p + rsa_keygen->p_sz;
++    rsa_keygen->addr_e     = rsa_keygen->addr_q     + rsa_keygen->q_sz;
++    rsa_keygen->phy_addr_e = rsa_keygen->phy_addr_q + rsa_keygen->q_sz;
++    rsa_keygen->addr_n     = rsa_keygen->addr_e     + rsa_keygen->e_sz;
++    rsa_keygen->phy_addr_n = rsa_keygen->phy_addr_e + rsa_keygen->e_sz;
++    rsa_keygen->addr_d     = rsa_keygen->addr_n     + rsa_keygen->n_sz;
++    rsa_keygen->phy_addr_d = rsa_keygen->phy_addr_n + rsa_keygen->n_sz;
++    rsa_keygen->addr_dSz   = rsa_keygen->addr_d     + rsa_keygen->d_sz;
++    rsa_keygen->phy_addr_dSz = rsa_keygen->phy_addr_d   + rsa_keygen->d_sz;
++    rsa_keygen->addr_dp      = rsa_keygen->addr_dSz     + rsa_keygen->dSz_sz;
++    rsa_keygen->phy_addr_dp  = rsa_keygen->phy_addr_dSz + rsa_keygen->dSz_sz;
++    rsa_keygen->addr_dq      = rsa_keygen->addr_dp      + rsa_keygen->dp_sz;
++    rsa_keygen->phy_addr_dq  = rsa_keygen->phy_addr_dp  + rsa_keygen->dp_sz;
++    rsa_keygen->addr_c       = rsa_keygen->addr_dq      + rsa_keygen->dq_sz;
++    rsa_keygen->phy_addr_c   = rsa_keygen->phy_addr_dq  + rsa_keygen->dq_sz;
++
++    return ret;
++
++g_alloc_fail:
++    kfree(rsa_keygen->desc);
++desc_alloc_fail:
++    return -ENOMEM;
++}
++EXPORT_SYMBOL(caam_rsa_keygen_init);
++
++int caam_rsa_keygen_deinit(caam_rsa_keygen_t *rsa_keygen)
++{
++    struct device *jrdev = caam_pka_ctx->jrdev;
++    size_t total_len;
++
++    total_len = rsa_keygen->g_sz + rsa_keygen->f_sz + rsa_keygen->n_sz +
++        rsa_keygen->d_sz + rsa_keygen->p_sz + rsa_keygen->q_sz +
++        rsa_keygen->dp_sz + rsa_keygen->dq_sz + rsa_keygen->c_sz +
++        rsa_keygen->dSz_sz;
++    dma_free_coherent(jrdev, total_len, (void *)rsa_keygen->addr_p,
++        rsa_keygen->phy_addr_p);
++
++    kfree(rsa_keygen->desc);
++
++	return 0;
++}
++EXPORT_SYMBOL(caam_rsa_keygen_deinit);
++
++void caam_rsa_keygen_jobdesc(u32 *desc, caam_rsa_keygen_t *rsa_keygen)
++{
++    u32 op = 0;
++
++    init_job_desc_pdb(desc, 0, SIZEOF_RSA_KEYGEN_00_PDB);
++    append_cmd(desc, 0); /* sgf */
++    append_cmd(desc, rsa_keygen->p_sz);
++    append_cmd(desc, ((rsa_keygen->n_sz & 0x3ff) << RSA_PDB_N_SHIFT)
++        | (rsa_keygen->e_sz & 0x3ff));
++
++    append_ptr(desc, rsa_keygen->phy_addr_p);
++    append_ptr(desc, rsa_keygen->phy_addr_q);
++    append_ptr(desc, rsa_keygen->phy_addr_e);
++    append_ptr(desc, rsa_keygen->phy_addr_n);
++    append_ptr(desc, rsa_keygen->phy_addr_d);
++    append_ptr(desc, rsa_keygen->phy_addr_dSz);
++    append_ptr(desc, rsa_keygen->phy_addr_dp);
++    append_ptr(desc, rsa_keygen->phy_addr_dq);
++    append_ptr(desc, rsa_keygen->phy_addr_c);
++
++    /* check if creating a black key */
++    op = (OP_TYPE_UNI_PROTOCOL | OP_PCLID_RSA_KEYGEN);
++    if (rsa_keygen->key_color) {
++        op |= CAAM_PROTINFO_RSA_KEYGEN_SEC_KEY;
++    }
++    append_operation(desc, op);
++
++    /* sync input values; p, q, e */
++    dma_sync_single_for_device(caam_pka_ctx->jrdev, rsa_keygen->phy_addr_p,
++        rsa_keygen->p_sz + rsa_keygen->q_sz + rsa_keygen->e_sz, DMA_TO_DEVICE);
++}
++
++int caam_rsa_keygen(caam_rsa_keygen_t *rsa_keygen)
++{
++    struct device *jrdev = caam_pka_ctx->jrdev;
++    u32 *desc = rsa_keygen->desc;
++    int ret   = 0;
++    struct caam_operation_result res;
++    size_t total_len;
++
++    memset(desc, 0, MAX_CAAM_DESCSIZE * sizeof(u32));
++    caam_rsa_keygen_jobdesc(desc, rsa_keygen);
++
++    res.err = 0;
++    init_completion(&res.completion);
++
++    ret = caam_jr_enqueue(jrdev, desc, caam_operation_done, &res);
++    if (ret == -EINPROGRESS) {
++        wait_for_completion(&res.completion);
++        ret = res.err;
++    }
++
++    /* sync results; n, d, dp, dq, c */
++    total_len = rsa_keygen->n_sz + rsa_keygen->d_sz + rsa_keygen->dp_sz +
++        rsa_keygen->dq_sz + rsa_keygen->c_sz + rsa_keygen->dSz_sz;
++    dma_sync_single_for_cpu(jrdev, rsa_keygen->phy_addr_n, total_len,
++        DMA_FROM_DEVICE);
++    return ret;
++}
++EXPORT_SYMBOL(caam_rsa_keygen);
++
+ struct device *caam_pkcsec_get_jrdev(void)
+ {
+-	if (caam_ecdsa_ctx != NULL) {
+-		if (caam_ecdsa_ctx->jrdev != NULL) {
+-			return caam_ecdsa_ctx->jrdev;
++	if (caam_pka_ctx != NULL) {
++		if (caam_pka_ctx->jrdev != NULL) {
++			return caam_pka_ctx->jrdev;
+ 		}
+ 	}
+ 	return NULL;
+@@ -1339,7 +1729,7 @@ EXPORT_SYMBOL(caam_pkcsec_get_jrdev);
+ 
+ int caam_pk_status(void)
+ {
+-	return NULL != caam_ecdsa_ctx ? 1:0;
++	return NULL != caam_pka_ctx ? 1:0;
+ }
+ EXPORT_SYMBOL(caam_pk_status);
+ 
+@@ -1355,9 +1745,117 @@ const ec_curve_t *caam_select_ec_curve(int cid)
+ 	return NULL;
+ }
+ 
++int caam_ecdsa_ecdh_init(caam_ecdsa_ecdh_t *ecdsa_ecdh)
++{
++    struct device *jrdev = caam_pka_ctx->jrdev;
++    const ec_curve_data_t *curve_data;
++    int ret = 0;
++    size_t total_len;
++
++    ecdsa_ecdh->curve = caam_select_ec_curve(ecdsa_ecdh->curve_id);
++    if (unlikely(!ecdsa_ecdh->curve))
++        goto generic_ecdh_init_fail;
++
++    curve_data       = &ecdsa_ecdh->curve->data;
++    ecdsa_ecdh->desc = kmalloc(MAX_CAAM_DESCSIZE * sizeof(u32),
++        GFP_KERNEL | GFP_DMA);
++    if (unlikely(!ecdsa_ecdh->desc))
++        goto generic_ecdh_init_fail;
++
++    total_len = curve_data->l_len + curve_data->n_len * 2;
++    ecdsa_ecdh->addr_s = dma_alloc_coherent(jrdev, total_len,
++                &ecdsa_ecdh->phy_addr_s, GFP_KERNEL | GFP_DMA);
++    if (unlikely(!ecdsa_ecdh->addr_s))
++        goto q_alloc_fail;
++
++    /* map pointer in the buffer alloc'd; s points to public key (x,y), f points
++     * to the private key, c points to the output buffer */
++    memset(ecdsa_ecdh->addr_s, 0, total_len);
++    ecdsa_ecdh->addr_f = ecdsa_ecdh->addr_s + (curve_data->l_len * 2);
++    ecdsa_ecdh->phy_addr_f = ecdsa_ecdh->phy_addr_s + (curve_data->l_len * 2);
++    ecdsa_ecdh->addr_c = ecdsa_ecdh->addr_f + curve_data->n_len;
++    ecdsa_ecdh->phy_addr_c = ecdsa_ecdh->phy_addr_f + curve_data->n_len;
++
++    return ret;
++
++q_alloc_fail:
++    kfree(ecdsa_ecdh->desc);
++generic_ecdh_init_fail:
++    return -ENOMEM;
++}
++EXPORT_SYMBOL(caam_ecdsa_ecdh_init);
++
++int caam_ecdsa_ecdh_deinit(caam_ecdsa_ecdh_t *ecdsa_ecdh)
++{
++    struct device *jrdev = caam_pka_ctx->jrdev;
++    const ec_curve_data_t *curve_data = &ecdsa_ecdh->curve->data;
++
++    dma_free_coherent(jrdev, curve_data->l_len + curve_data->n_len * 2,
++        (void *)ecdsa_ecdh->addr_s, ecdsa_ecdh->phy_addr_s);
++    kfree(ecdsa_ecdh->desc);
++
++    return 0;
++}
++EXPORT_SYMBOL(caam_ecdsa_ecdh_deinit);
++
++static void caam_ecdsa_ecdh_jobdesc(u32 *desc, caam_ecdsa_ecdh_t *ecdsa_ecdh)
++{
++    const ec_curve_t *curve = caam_select_ec_curve(ecdsa_ecdh->curve_id);
++    const ec_curve_data_t *curve_data = &curve->data;
++    u32 op;
++
++    init_job_desc_pdb(desc, 0, SIZEOF_ECDSA_ECDH_PDB);
++    append_cmd(desc, OP_ECDSEL_ECDH_PD |
++        (curve_data->caam_ec_id << OP_ECDSEL_SHIFT));
++    append_ptr(desc, ecdsa_ecdh->phy_addr_s); /* public key */
++    append_ptr(desc, ecdsa_ecdh->phy_addr_f); /* private key */
++    append_ptr(desc, ecdsa_ecdh->phy_addr_c); /* shared secret output */
++
++    op = CAAM_PROTOP_CTYPE | OP_TYPE_UNI_PROTOCOL | OP_PCLID_ECDH |
++         OP_PCL_PKPROT_ECC;
++    if (ecdsa_ecdh->key_color == KEY_COLOR_BLACK) {
++        op |= CAAM_PROTINFO_SEC_KEY;
++    }
++    append_operation(desc, op);
++
++    /* sync inputs (x,y) and s */
++    dma_sync_single_for_device(caam_pka_ctx->jrdev,
++        ecdsa_ecdh->phy_addr_s, curve_data->n_len * 3, DMA_TO_DEVICE);
++
++}
++
++int caam_ecdsa_ecdh(caam_ecdsa_ecdh_t *ecdsa_ecdh)
++{
++    struct device *jrdev = caam_pka_ctx->jrdev;
++    u32 *desc = ecdsa_ecdh->desc;
++    int ret = 0;
++    struct caam_operation_result res;
++
++    const ec_curve_data_t *curve_data = &ecdsa_ecdh->curve->data;
++
++    memset(desc, 0, MAX_CAAM_DESCSIZE * sizeof(u32));
++
++    caam_ecdsa_ecdh_jobdesc(desc, ecdsa_ecdh);
++
++    res.err = 0;
++    init_completion(&res.completion);
++
++    ret = caam_jr_enqueue(jrdev, desc, caam_operation_done, &res);
++    if (ret == -EINPROGRESS) {
++        wait_for_completion(&res.completion);
++        ret = res.err;
++    }
++
++    dma_sync_single_for_cpu(jrdev, ecdsa_ecdh->phy_addr_c,
++                    curve_data->n_len, DMA_FROM_DEVICE);
++
++    return ret;
++}
++EXPORT_SYMBOL(caam_ecdsa_ecdh);
++
+ int caam_ecdsa_sign_init(caam_ecdsa_sign_t *ecdsa_sign)
+ {
+-	struct device *jrdev = caam_ecdsa_ctx->jrdev;
++	struct device *jrdev = caam_pka_ctx->jrdev;
+ 	const ec_curve_data_t *curve_data;
+ 	int ret = 0;
+ 	size_t total_len;
+@@ -1372,7 +1870,7 @@ int caam_ecdsa_sign_init(caam_ecdsa_sign_t *ecdsa_sign)
+ 					sizeof(u32), GFP_KERNEL | GFP_DMA);
+ 	if (unlikely(!ecdsa_sign->desc))
+ 		goto desc_alloc_fail;
+-	total_len = curve_data->l_len + curve_data->n_len * 3;
++	total_len = curve_data->l_len + ecdsa_sign->f_sz + curve_data->n_len * 2;
+ 	ecdsa_sign->addr_s = dma_alloc_coherent(jrdev, total_len,
+ 				&ecdsa_sign->phy_addr_s, GFP_KERNEL | GFP_DMA);
+ 	if (unlikely(!ecdsa_sign->addr_s))
+@@ -1381,8 +1879,8 @@ int caam_ecdsa_sign_init(caam_ecdsa_sign_t *ecdsa_sign)
+ 	memset(ecdsa_sign->addr_s, 0, total_len);
+ 	ecdsa_sign->addr_f = ecdsa_sign->addr_s + curve_data->l_len;
+ 	ecdsa_sign->phy_addr_f = ecdsa_sign->phy_addr_s + curve_data->l_len;
+-	ecdsa_sign->addr_c = ecdsa_sign->addr_f + curve_data->n_len;
+-	ecdsa_sign->phy_addr_c = ecdsa_sign->phy_addr_f + curve_data->n_len;
++	ecdsa_sign->addr_c = ecdsa_sign->addr_f + ecdsa_sign->f_sz;
++	ecdsa_sign->phy_addr_c = ecdsa_sign->phy_addr_f + ecdsa_sign->f_sz;
+ 	ecdsa_sign->addr_d = ecdsa_sign->addr_c + curve_data->n_len;
+ 	ecdsa_sign->phy_addr_d = ecdsa_sign->phy_addr_c + curve_data->n_len;
+ 
+@@ -1399,12 +1897,13 @@ EXPORT_SYMBOL(caam_ecdsa_sign_init);
+ 
+ int caam_ecdsa_sign_deinit(caam_ecdsa_sign_t *ecdsa_sign)
+ {
+-	struct device *jrdev = caam_ecdsa_ctx->jrdev;
++	struct device *jrdev = caam_pka_ctx->jrdev;
+ 
+ 	const ec_curve_data_t *curve_data = &ecdsa_sign->curve->data;
+ 
+-	dma_free_coherent(jrdev, curve_data->l_len + curve_data->n_len * 3,
+-	(void *)ecdsa_sign->addr_s, ecdsa_sign->phy_addr_s);
++	dma_free_coherent(jrdev, curve_data->l_len + ecdsa_sign->f_sz +
++        curve_data->n_len * 2, (void *)ecdsa_sign->addr_s,
++        ecdsa_sign->phy_addr_s);
+ 
+ 	kfree(ecdsa_sign->desc);
+ 
+@@ -1414,7 +1913,7 @@ EXPORT_SYMBOL(caam_ecdsa_sign_deinit);
+ 
+ int caam_ecdsa_sign(caam_ecdsa_sign_t *ecdsa_sign)
+ {
+-	struct device *jrdev = caam_ecdsa_ctx->jrdev;
++	struct device *jrdev = caam_pka_ctx->jrdev;
+ 	u32 *desc = ecdsa_sign->desc;
+ 	int ret = 0;
+ 	struct caam_operation_result res;
+@@ -1445,7 +1944,7 @@ EXPORT_SYMBOL(caam_ecdsa_sign);
+ 
+ int caam_ecdsa_verify_init(caam_ecdsa_verify_t *ecdsa_verify)
+ {
+-	struct device *jrdev = caam_ecdsa_ctx->jrdev;
++	struct device *jrdev = caam_pka_ctx->jrdev;
+ 	const ec_curve_data_t *curve_data;
+ 	int ret = 0;
+ 	size_t total_len;
+@@ -1459,7 +1958,7 @@ int caam_ecdsa_verify_init(caam_ecdsa_verify_t *ecdsa_verify)
+ 				sizeof(u32), GFP_KERNEL | GFP_DMA);
+ 	if (unlikely(!ecdsa_verify->desc))
+ 		goto desc_alloc_fail;
+-	total_len = curve_data->l_len * 4 + curve_data->n_len * 3;
++	total_len = curve_data->l_len * 4 + curve_data->n_len * 2 + ecdsa_verify->f_sz;
+ 	ecdsa_verify->addr_w = dma_alloc_coherent(jrdev, total_len,
+ 		&ecdsa_verify->phy_addr_w, GFP_KERNEL | GFP_DMA);
+ 	if (unlikely(!ecdsa_verify->addr_w))
+@@ -1469,9 +1968,9 @@ int caam_ecdsa_verify_init(caam_ecdsa_verify_t *ecdsa_verify)
+ 	ecdsa_verify->addr_f = ecdsa_verify->addr_w + curve_data->l_len * 2;
+ 	ecdsa_verify->phy_addr_f  = ecdsa_verify->phy_addr_w +
+ 			curve_data->l_len * 2;
+-	ecdsa_verify->addr_c = ecdsa_verify->addr_f + curve_data->n_len;
++	ecdsa_verify->addr_c = ecdsa_verify->addr_f + ecdsa_verify->f_sz;
+ 	ecdsa_verify->phy_addr_c  = ecdsa_verify->phy_addr_f +
+-			curve_data->n_len;
++			ecdsa_verify->f_sz;
+ 	ecdsa_verify->addr_d = ecdsa_verify->addr_c + curve_data->n_len;
+ 	ecdsa_verify->phy_addr_d  = ecdsa_verify->phy_addr_c +
+ 			curve_data->n_len;
+@@ -1492,11 +1991,11 @@ EXPORT_SYMBOL(caam_ecdsa_verify_init);
+ 
+ int caam_ecdsa_verify_deinit(caam_ecdsa_verify_t *ecdsa_verify)
+ {
+-	struct device *jrdev = caam_ecdsa_ctx->jrdev;
++	struct device *jrdev = caam_pka_ctx->jrdev;
+ 	const ec_curve_data_t *curve_data = &ecdsa_verify->curve->data;
+ 
+ 	dma_free_coherent(jrdev, curve_data->l_len * 2 +
+-			curve_data->n_len * 3,
++			curve_data->n_len * 2 + ecdsa_verify->f_sz,
+ 			(void *)ecdsa_verify->addr_w,
+ 			ecdsa_verify->phy_addr_w);
+ 	kfree(ecdsa_verify->desc);
+@@ -1508,7 +2007,7 @@ EXPORT_SYMBOL(caam_ecdsa_verify_deinit);
+ 
+ int caam_ecdsa_verify(caam_ecdsa_verify_t *ecdsa_verify)
+ {
+-	struct device *jrdev = caam_ecdsa_ctx->jrdev;
++	struct device *jrdev = caam_pka_ctx->jrdev;
+ 	u32 *desc = ecdsa_verify->desc;
+ 
+ 	int ret = 0;
+@@ -1538,7 +2037,7 @@ EXPORT_SYMBOL(caam_ecdsa_verify);
+ 
+ int caam_ecdsa_keygen_init(caam_ecdsa_keygen_t *ecdsa_keygen)
+ {
+-	struct device *jrdev = caam_ecdsa_ctx->jrdev;
++	struct device *jrdev = caam_pka_ctx->jrdev;
+ 	const ec_curve_data_t *curve_data = NULL;
+ 	int ret = 0;
+ 	size_t total_len;
+@@ -1576,7 +2075,7 @@ EXPORT_SYMBOL(caam_ecdsa_keygen_init);
+ 
+ int caam_ecdsa_keygen_deinit(caam_ecdsa_keygen_t *ecdsa_keygen)
+ {
+-	struct device *jrdev = caam_ecdsa_ctx->jrdev;
++	struct device *jrdev = caam_pka_ctx->jrdev;
+ 	const ec_curve_data_t *curve_data = NULL;
+ 	curve_data = &ecdsa_keygen->curve->data;
+ 
+@@ -1591,7 +2090,7 @@ EXPORT_SYMBOL(caam_ecdsa_keygen_deinit);
+ 
+ int caam_ecdsa_keygen(caam_ecdsa_keygen_t *ecdsa_keygen)
+ {
+-	struct device *jrdev = caam_ecdsa_ctx->jrdev;
++	struct device *jrdev = caam_pka_ctx->jrdev;
+ 	u32 *desc = ecdsa_keygen->desc;
+ 	const ec_curve_data_t *curve_data = &ecdsa_keygen->curve->data;
+ 
+@@ -1628,23 +2127,34 @@ void caam_ecdsa_sign_jobdesc(u32 *desc, caam_ecdsa_sign_t *ecdsa_sign)
+ 	const ec_curve_data_t *curve_data = &curve->data;
+ 	u32 op;
+ 
+-	init_job_desc_pdb(desc, 0, SIZEOF_ECDSA_SIGN_PDB);
++    if (ecdsa_sign->f_sz > 0) { /* add size of message to PDB */
++	    init_job_desc_pdb(desc, 0, SIZEOF_ECDSA_SIGN_PDB+1);
++    }
++    else {
++	    init_job_desc_pdb(desc, 0, SIZEOF_ECDSA_SIGN_PDB);
++    }
+ 	append_cmd(desc, ((curve_data->caam_ec_id & 0x7F) << 7) | CAAM_ECDSA_PD);
+ 	append_ptr(desc, ecdsa_sign->phy_addr_s);
+ 	append_ptr(desc, ecdsa_sign->phy_addr_f);
+ 	append_ptr(desc, ecdsa_sign->phy_addr_c);
+ 	append_ptr(desc, ecdsa_sign->phy_addr_d);
++    if (ecdsa_sign->f_sz > 0) { /* add size of message to PDB */
++	    append_cmd(desc, ecdsa_sign->f_sz);
++    }
+ 
+ 	op = CAAM_PROTOP_CTYPE | OP_TYPE_UNI_PROTOCOL |
+ 			OP_PCLID_DSASIGN | OP_PCL_PKPROT_ECC;
+ 	op |= (ecdsa_sign->key_color ==
+ 		KEY_COLOR_BLACK) ? CAAM_PROTINFO_SEC_KEY:0;
++    if (ecdsa_sign->f_sz > 0) { /* use MES_REP 10b for hashed message */
++        op |= OP_PCL_ECDSA_MES_REP_HASHED;
++    }
+ 
+ 	append_operation(desc, op);
+ 
+-    dma_sync_single_for_device(caam_ecdsa_ctx->jrdev,
++    dma_sync_single_for_device(caam_pka_ctx->jrdev,
+ 		ecdsa_sign->phy_addr_s, curve_data->l_len * 2 +
+-		curve_data->n_len * 2, DMA_TO_DEVICE);
++		curve_data->n_len * 1 + ecdsa_sign->f_sz, DMA_TO_DEVICE);
+ 
+ }
+ 
+@@ -1655,20 +2165,32 @@ void caam_ecdsa_verify_jobdesc(u32 *desc, caam_ecdsa_verify_t *ecdsa_verify)
+ 
+ 	u32 op;
+ 
+-	init_job_desc_pdb(desc, 0, SIZEOF_ECDSA_VERIFY_PDB);
++    if (ecdsa_verify->f_sz > 0) { /* add size of message to PDB */
++	    init_job_desc_pdb(desc, 0, SIZEOF_ECDSA_VERIFY_PDB+1);
++    }
++    else {
++	    init_job_desc_pdb(desc, 0, SIZEOF_ECDSA_VERIFY_PDB);
++    }
+ 	append_cmd(desc, ((curve_data->caam_ec_id & 0x7F) << 7) | CAAM_ECDSA_PD);
+ 	append_ptr(desc, ecdsa_verify->phy_addr_w);
+ 	append_ptr(desc, ecdsa_verify->phy_addr_f);
+ 	append_ptr(desc, ecdsa_verify->phy_addr_c);
+ 	append_ptr(desc, ecdsa_verify->phy_addr_d);
+ 	append_ptr(desc, ecdsa_verify->phy_addr_tmp);
++    if (ecdsa_verify->f_sz > 0) {
++        append_cmd(desc, ecdsa_verify->f_sz);
++    }
+ 	op = CAAM_PROTOP_CTYPE | OP_TYPE_UNI_PROTOCOL |
+ 			OP_PCLID_DSAVERIFY | OP_PCL_PKPROT_ECC;
++    if (ecdsa_verify->f_sz > 0) { /* use MES_REP 10b for hashed message */
++        op |= OP_PCL_ECDSA_MES_REP_HASHED;
++    }
+ 	append_operation(desc, op);
+ 
+-	dma_sync_single_for_device(caam_ecdsa_ctx->jrdev,
++	dma_sync_single_for_device(caam_pka_ctx->jrdev,
+ 					ecdsa_verify->phy_addr_w,
+-	curve_data->l_len * 4 + curve_data->n_len * 3, DMA_TO_DEVICE);
++	curve_data->l_len * 4 + curve_data->n_len * 2 + ecdsa_verify->f_sz,
++    DMA_TO_DEVICE);
+ 
+ }
+ 
+@@ -1689,15 +2211,160 @@ void caam_ecdsa_keygen_jobdesc(u32 *desc, caam_ecdsa_keygen_t *ecdsa_keygen)
+ 	append_operation(desc, op);
+ 
+ 
+-    dma_sync_single_for_device(caam_ecdsa_ctx->jrdev,
++    dma_sync_single_for_device(caam_pka_ctx->jrdev,
+ 	ecdsa_keygen->phy_addr_s, curve_data->l_len * 3, DMA_TO_DEVICE);
+ }
+ 
++
++static int caam_pkha_clear_memory(u32* desc)
++{
++    struct device *jrdev = caam_pka_ctx->jrdev;
++    int ret = -ENOMEM;
++    struct caam_operation_result res;
++    uint32_t m;
++
++    memset(desc, 0, MAX_CAAM_DESCSIZE * sizeof(u32));
++
++    /* clear Aram, Bram, Eram, and Nram */
++    m = 0x0F << 16;
++
++    init_job_desc(desc, 0);
++    append_operation(desc, OP_TYPE_PK | OP_ALG_PK | m | OP_ALG_PKMODE_CLEARMEM);
++
++    res.err = 0;
++    init_completion(&res.completion);
++
++    ret = caam_jr_enqueue(jrdev, desc, caam_operation_done, &res);
++    if (ret == -EINPROGRESS) {
++        /* in progress */
++        wait_for_completion_timeout(&res.completion, HZ);
++        ret = res.err;
++    }
++
++    return ret;
++}
++
++
++int caam_mul_mod(u8 *k, uint16_t kSz, u8 *a, uint16_t aSz, u8 *n, uint16_t nSz,
++    u8 *a24, uint16_t a24Sz, u8 *out, uint16_t outSz, unsigned char outLE)
++{
++    struct device *jrdev = caam_pka_ctx->jrdev;
++    struct caam_operation_result res;
++    dma_addr_t phy_k, phy_a, phy_n, phy_a24, phy_out;
++    u8 *addr_k, *addr_a, *addr_n, *addr_a24, *addr_out;
++    int ret = 0;
++    u32 *desc;
++    u32 op = 0;
++
++    desc = kmalloc(MAX_CAAM_DESCSIZE * sizeof(u32), GFP_KERNEL | GFP_DMA);
++	if (unlikely(!desc))
++		goto desc_alloc_fail;
++
++    addr_k = dma_alloc_coherent(jrdev, kSz + aSz + nSz + a24Sz + outSz,
++        &phy_k, GFP_KERNEL | GFP_DMA);
++    if (unlikely(!addr_k)) {
++        ret = -ENOMEM;
++        goto dma_alloc_fail;
++    }
++    phy_a   = phy_k + kSz;
++    phy_a24 = phy_a + aSz;
++    phy_n   = phy_a24 + a24Sz;
++    phy_out = phy_n + nSz;
++
++    addr_a = addr_k + kSz;
++    addr_a24 = addr_a + aSz;
++    addr_n = addr_a24 + a24Sz;
++    addr_out = addr_n + nSz;
++
++    if (unlikely(copy_from_user(addr_k, k, kSz))) {
++        dev_err(jrdev, "copy_from_user error k \n");
++        ret = -EFAULT;
++        goto end_caam_mul_mod;
++    }
++
++    if (unlikely(copy_from_user(addr_a, a, aSz))) {
++        dev_err(jrdev, "copy_from_user error a \n");
++        ret = -EFAULT;
++        goto end_caam_mul_mod;
++    }
++
++    if (unlikely(copy_from_user(addr_a24, a24, a24Sz))) {
++        dev_err(jrdev, "copy_from_user error a24 \n");
++        ret = -EFAULT;
++        goto end_caam_mul_mod;
++    }
++
++    if (unlikely(copy_from_user(addr_n, n, nSz))) {
++        dev_err(jrdev, "copy_from_user error n \n");
++        ret = -EFAULT;
++        goto end_caam_mul_mod;
++    }
++
++    if (caam_pkha_clear_memory(desc) != 0) {
++        dev_err(jrdev,"Error clearing PKHA memory\n");
++        ret = -EFAULT;
++        goto end_caam_mul_mod;
++    }
++
++    /* reset 'desc' and prepare it for new job */
++    memset(desc, 0, MAX_CAAM_DESCSIZE * sizeof(u32));
++    init_job_desc(desc, 0);
++
++    /* load k into PKHA E memory */
++    append_key(desc, phy_k, kSz, CLASS_1 | KEY_DEST_PKHA_E | KEY_DEST_SET_PKLE);
++    append_fifo_load(desc, phy_a, aSz, LDST_CLASS_1_CCB | FIFOLD_TYPE_PK_A0 |
++        FIFOLD_PKLE_SET);
++    append_fifo_load(desc, phy_a24, a24Sz, LDST_CLASS_1_CCB | FIFOLD_TYPE_PK_A3
++        | FIFOLD_PKLE_SET);
++    append_fifo_load(desc, phy_n, nSz, LDST_CLASS_1_CCB | FIFOLD_TYPE_PK_N |
++        FIFOLD_PKLE_SET);
++
++    op = OP_TYPE_PK | OP_ALG_PK;
++    op |= OP_ALG_PKMODE_TIME_EQ;
++    op |= OP_ALG_PKMODE_ECM_MOD_MULT;
++    append_operation(desc, op);
++
++    /* if the output is little endian then swap it on store */
++    if (outLE) {
++        append_fifo_store(desc, phy_out, outSz, LDST_CLASS_1_CCB |
++            FIFOST_TYPE_PKHA_B1 | FIFOLD_PKLE_SET);
++    }
++    else {
++        append_fifo_store(desc, phy_out, outSz, LDST_CLASS_1_CCB |
++            FIFOST_TYPE_PKHA_B1);
++    }
++
++    dma_sync_single_for_device(jrdev, phy_k, kSz + aSz + a24Sz + nSz,
++        DMA_TO_DEVICE);
++    res.err = 0;
++    init_completion(&res.completion);
++    ret = caam_jr_enqueue(jrdev, desc, caam_operation_done, &res);
++    if (ret == -EINPROGRESS) {
++        wait_for_completion_timeout(&res.completion, HZ);
++        ret = res.err;
++    }
++    dma_sync_single_for_cpu(jrdev, phy_out, outSz, DMA_FROM_DEVICE);
++    if (unlikely(copy_to_user(out, addr_out, outSz))) {
++        ret = -EFAULT;
++    }
++
++end_caam_mul_mod:
++    dma_free_coherent(jrdev, kSz + aSz + a24Sz + nSz + outSz, (void*)addr_k,
++        phy_k);
++dma_alloc_fail:
++    kfree(desc);
++    return ret;
++
++desc_alloc_fail:
++    return -ENOMEM;
++}
++EXPORT_SYMBOL(caam_mul_mod);
++
+ void caam_operation_done(struct device *dev, u32 *desc, u32 err, void *context)
+ {
+ 	struct caam_operation_result *res = context;
+ 
+-	dev_err(dev, "%s %d: err 0x%x\n", __func__, __LINE__, err);
++	dev_dbg(dev, "%s %d: err 0x%x\n", __func__, __LINE__, err);
+ 	if (err)
+ 		caam_jr_strstatus(dev, err);
+ 
+@@ -1706,31 +2373,29 @@ void caam_operation_done(struct device *dev, u32 *desc, u32 err, void *context)
+ }
+ 
+ 
+-static int caam_ecdsa_init(void) {
++static int caam_pka_init(void) {
+ 	struct device *jrdev;
+ 
+-	printk("caam_ecdsa init\n");
+ 	jrdev = caam_jr_alloc();
+ 	if (IS_ERR(jrdev)) {
+-		caam_ecdsa_ctx = NULL;
++		caam_pka_ctx = NULL;
+ 		pr_err("Job Ring Device allocation for transform failed\n");
+ 		return PTR_ERR(jrdev);
+ 	}
+-	caam_ecdsa_ctx = kmalloc(sizeof(struct caam_ecdsa_ctx_t), GFP_DMA | GFP_KERNEL);
+-	if (unlikely(!caam_ecdsa_ctx))
++	caam_pka_ctx = kmalloc(sizeof(struct caam_pka_ctx_t), GFP_DMA | GFP_KERNEL);
++	if (unlikely(!caam_pka_ctx))
+ 		return -ENOMEM;
+ 
+-	caam_ecdsa_ctx->jrdev = jrdev;
++	caam_pka_ctx->jrdev = jrdev;
+ 
+ 	return 0;
+ }
+ 
+ static void caam_ecdsa_exit(void)
+ {
+-	printk("caam_ecdsa exit\n");
+-	caam_jr_free(caam_ecdsa_ctx->jrdev);
+-	kfree(caam_ecdsa_ctx);
+-	caam_ecdsa_ctx = NULL;
++	caam_jr_free(caam_pka_ctx->jrdev);
++	kfree(caam_pka_ctx);
++	caam_pka_ctx = NULL;
+ }
+ 
+ /* Public Key Cryptography module initialization handler */
+@@ -1770,9 +2435,9 @@ int caam_pkc_init(struct device *ctrldev)
+ 		dev_info(ctrldev, "caam pkc algorithms registered in /proc/crypto\n");
+ 	}
+ 
+-	err = caam_ecdsa_init();
++	err = caam_pka_init();
+ 	if (err) {
+-		dev_warn(ctrldev, "caam ecdsa init failed\n");
++		dev_warn(ctrldev, "caam pka init failed\n");
+ 	}
+ 
+ 	return err;
+diff --git a/drivers/crypto/caam/caampkc.h b/drivers/crypto/caam/caampkc.h
+index d15bde41ab89..d0f151306870 100644
+--- a/drivers/crypto/caam/caampkc.h
++++ b/drivers/crypto/caam/caampkc.h
+@@ -167,11 +167,12 @@ typedef struct {
+ 	dma_addr_t phy_addr_f;
+ 	dma_addr_t phy_addr_c;
+ 	dma_addr_t phy_addr_d;
++	size_t f_sz; /* message size */
+ 	u32 curve_id;
+ 	const ec_curve_t *curve;
+ 	u8 key_color;
+ 	u32 *desc;
+-} caam_ecdsa_sign_t;
++} caam_ecdsa_sign_t, caam_ecdsa_ecdh_t;
+ 
+ typedef struct {
+ 	u8 *addr_w; /* public key */
+@@ -184,6 +185,7 @@ typedef struct {
+ 	dma_addr_t phy_addr_c;
+ 	dma_addr_t phy_addr_d;
+ 	dma_addr_t phy_addr_tmp;
++	size_t f_sz; /* message size */
+ 	u32 curve_id;
+ 	const ec_curve_t *curve;
+ 	u8	key_color;
+@@ -201,6 +203,66 @@ typedef struct {
+ 	u32 *desc;
+ } caam_ecdsa_keygen_t;
+ 
++
++typedef struct {
++	u8 *addr_f; /* input message */
++	u8 *addr_g; /* result of rsa operation */
++	u8 *addr_n; /* public modulus */
++	u8 *addr_e; /* rsa exponent */
++	dma_addr_t phy_addr_f;
++	dma_addr_t phy_addr_g;
++	dma_addr_t phy_addr_n;
++	dma_addr_t phy_addr_e;
++	size_t f_sz;
++	size_t g_sz;
++	size_t n_sz;
++	size_t e_sz;
++	u8 key_color;
++	u32 *desc;
++} caam_rsa_public_t;
++
++typedef struct {
++	u8 *addr_g; /* input value */
++	u8 *addr_f; /* decrypted output value */
++	u8 *addr_n; /* n depending on the form used */
++	u8 *addr_d; /* private key, can be null depending on form used */
++	u8 *addr_p; /* prime value from key */
++	u8 *addr_q; /* prime value from key */
++	u8 *addr_dp; /* CRT values */
++	u8 *addr_dq;
++	u8 *addr_c;
++	u8 *addr_e; /* exponent for keygen */
++	u8 *addr_dSz; /* output of 'd' size with keygen */
++	u8 *addr_tmpp; /* used with form 3 */
++	u8 *addr_tmpq; /* used with form 3 */
++	dma_addr_t phy_addr_g;
++	dma_addr_t phy_addr_f;
++	dma_addr_t phy_addr_n;
++	dma_addr_t phy_addr_d;
++	dma_addr_t phy_addr_p;
++	dma_addr_t phy_addr_q;
++	dma_addr_t phy_addr_dp;
++	dma_addr_t phy_addr_dq;
++	dma_addr_t phy_addr_c;
++	dma_addr_t phy_addr_e;
++	dma_addr_t phy_addr_dSz;
++	dma_addr_t phy_addr_tmpp; /* used with form 3 */
++	dma_addr_t phy_addr_tmpq; /* used with form 3 */
++	size_t g_sz;
++	size_t f_sz;
++	size_t n_sz;
++	size_t d_sz;
++	size_t p_sz;
++	size_t q_sz;
++	size_t dp_sz;
++	size_t dq_sz;
++	size_t c_sz;
++	size_t e_sz;
++	size_t dSz_sz;
++	u8	key_color;
++	u32 *desc;
++} caam_rsa_private_t, caam_rsa_keygen_t;
++
+ /**
+  * caam_priv_key_form - CAAM RSA private key representation
+  * CAAM RSA private key may have either of three forms.
+@@ -342,6 +404,17 @@ void init_rsa_priv_f1_desc(u32 *desc, struct rsa_priv_f1_pdb *pdb);
+ void init_rsa_priv_f2_desc(u32 *desc, struct rsa_priv_f2_pdb *pdb);
+ void init_rsa_priv_f3_desc(u32 *desc, struct rsa_priv_f3_pdb *pdb);
+ 
++/* RSA operations */
++int caam_rsa_private(caam_rsa_private_t *rsa_private);
++int caam_rsa_private_deinit(caam_rsa_private_t *rsa_private);
++int caam_rsa_private_init(caam_rsa_private_t *rsa_private);
++int caam_rsa_public(caam_rsa_public_t *rsa_public);
++int caam_rsa_public_deinit(caam_rsa_public_t *rsa_public);
++int caam_rsa_public_init(caam_rsa_public_t *rsa_public);
++int caam_rsa_keygen_init(caam_rsa_keygen_t *rsa_keygen);
++int caam_rsa_keygen_deinit(caam_rsa_keygen_t *rsa_keygen);
++int caam_rsa_keygen(caam_rsa_keygen_t *rsa_keygen);
++
+ /* ECDSA operations */
+ void caam_ecdsa_verify_jobdesc(u32 *desc,
+ 	caam_ecdsa_verify_t *ecdsa_verify);
+@@ -358,8 +431,15 @@ int caam_ecdsa_sign_init(caam_ecdsa_sign_t *ecdsa_sign);
+ int caam_ecdsa_keygen_init(caam_ecdsa_keygen_t *ecdsa_keygen);
+ int caam_ecdsa_keygen_deinit(caam_ecdsa_keygen_t *ecdsa_keygen);
+ int caam_ecdsa_keygen(caam_ecdsa_keygen_t *ecdsa_keygen);
++int caam_ecdsa_ecdh_init(caam_ecdsa_ecdh_t *ecdsa_ecdh);
++int caam_ecdsa_ecdh_deinit(caam_ecdsa_ecdh_t *ecdsa_ecdh);
++int caam_ecdsa_ecdh(caam_ecdsa_ecdh_t *ecdsa_ecdh);
+ void caam_operation_done(struct device *dev, u32 *desc, u32 err,
+ 	void *context);
+ const ec_curve_t *caam_select_ec_curve(int cid);
+ 
++/* PKHA */
++int caam_mul_mod(u8 *k, uint16_t kSz, u8 *a, uint16_t aSz, u8 *n,
++    uint16_t nSz, u8 *a24, uint16_t a24Sz, u8 *out, uint16_t outSz,
++    unsigned char outLE);
+ #endif
+diff --git a/drivers/crypto/caam/desc.h b/drivers/crypto/caam/desc.h
+index 30724be7a6a0..18f905257373 100644
+--- a/drivers/crypto/caam/desc.h
++++ b/drivers/crypto/caam/desc.h
+@@ -178,6 +178,7 @@
+ 
+ #define KEY_DEST_CLASS_REG	(0x00 << KEY_DEST_SHIFT)
+ #define KEY_DEST_PKHA_E		(0x01 << KEY_DEST_SHIFT)
++#define KEY_DEST_SET_PKLE   (0x01 << 13)
+ #define KEY_DEST_AFHA_SBOX	(0x02 << KEY_DEST_SHIFT)
+ #define KEY_DEST_MDHA_SPLIT	(0x03 << KEY_DEST_SHIFT)
+ 
+@@ -309,6 +310,8 @@
+ #define FIFOLD_CLASS_CLASS1	(0x01 << FIFOLD_CLASS_SHIFT)
+ #define FIFOLD_CLASS_CLASS2	(0x02 << FIFOLD_CLASS_SHIFT)
+ #define FIFOLD_CLASS_BOTH	(0x03 << FIFOLD_CLASS_SHIFT)
++#define FIFOLD_PKLE_SHIFT   15
++#define FIFOLD_PKLE_SET     (0x1 << FIFOLD_PKLE_SHIFT)
+ 
+ #define FIFOST_CLASS_SHIFT	25
+ #define FIFOST_CLASS_MASK	(0x03 << FIFOST_CLASS_SHIFT)
+@@ -457,8 +460,10 @@
+ #define OP_PCLID_PUBLICKEYPAIR	(0x14 << OP_PCLID_SHIFT)
+ #define OP_PCLID_DSASIGN	(0x15 << OP_PCLID_SHIFT)
+ #define OP_PCLID_DSAVERIFY	(0x16 << OP_PCLID_SHIFT)
++#define OP_PCLID_ECDH       (0x17 << OP_PCLID_SHIFT)
+ #define OP_PCLID_RSAENC_PUBKEY  (0x18 << OP_PCLID_SHIFT)
+ #define OP_PCLID_RSADEC_PRVKEY  (0x19 << OP_PCLID_SHIFT)
++#define OP_PCLID_RSA_KEYGEN     (0x1A << OP_PCLID_SHIFT)
+ #define OP_PCLID_DKP_MD5	(0x20 << OP_PCLID_SHIFT)
+ #define OP_PCLID_DKP_SHA1	(0x21 << OP_PCLID_SHIFT)
+ #define OP_PCLID_DKP_SHA224	(0x22 << OP_PCLID_SHIFT)
+@@ -1142,6 +1147,16 @@
+ #define OP_PCL_PKPROT_ECC			 0x0002
+ #define OP_PCL_PKPROT_F2M			 0x0001
+ 
++/* predefined ECC curves */
++#define OP_ECDSEL_ECDH_PD (0x1 << 25)
++#define OP_ECDSEL_SHIFT 7
++
++
++/* type of input for ECDSA sign/verify */
++#define OP_PCL_ECDSA_MES_REP_SHIFT 10
++#define OP_PCL_ECDSA_MES_REP_HASHED (0x02 << OP_PCL_ECDSA_MES_REP_SHIFT)
++
++
+ /* Blob protocol protinfo bits */
+ #define OP_PCL_BLOB_TK			0x0200
+ #define OP_PCL_BLOB_EKT			0x0100
+@@ -1306,6 +1321,7 @@
+ #define OP_ALG_PKMODE_MOD_SUB_AB	0x003
+ #define OP_ALG_PKMODE_MOD_SUB_BA	0x004
+ #define OP_ALG_PKMODE_MOD_MULT		0x005
++#define OP_ALG_PKMODE_ECM_MOD_MULT	0x84B
+ #define OP_ALG_PKMODE_MOD_EXPO		0x006
+ #define OP_ALG_PKMODE_MOD_REDUCT	0x007
+ #define OP_ALG_PKMODE_MOD_INV		0x008
+diff --git a/drivers/crypto/caam/pdb.h b/drivers/crypto/caam/pdb.h
+index 68c1fd5dee5d..3667daddd9ef 100644
+--- a/drivers/crypto/caam/pdb.h
++++ b/drivers/crypto/caam/pdb.h
+@@ -486,6 +486,7 @@ struct dsa_verify_pdb {
+ #define RSA_PDB_D_MASK          (0xFFF << RSA_PDB_D_SHIFT)
+ #define RSA_PDB_Q_SHIFT         12
+ #define RSA_PDB_Q_MASK          (0xFFF << RSA_PDB_Q_SHIFT)
++#define RSA_PDB_N_SHIFT         16
+ 
+ #define RSA_PDB_SGF_F           (0x8 << RSA_PDB_SGF_SHIFT)
+ #define RSA_PDB_SGF_G           (0x4 << RSA_PDB_SGF_SHIFT)
+@@ -595,5 +596,6 @@ struct rsa_priv_f3_pdb {
+ };
+ 
+ #define SIZEOF_RSA_PRIV_F3_PDB	(2 * sizeof(u32) + 9 * caam_ptr_sz)
++#define SIZEOF_RSA_KEYGEN_00_PDB   (3 * sizeof(u32) + 9 * caam_ptr_sz)
+ 
+ #endif
